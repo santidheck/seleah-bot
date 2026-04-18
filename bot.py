@@ -7,18 +7,15 @@ from telegram.ext import (
 import anthropic
 from sheets import SheetsDB
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
-ALLOWED_USERS  = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x]
+ALLOWED_USERS  = [int(x) for x in os.environ.get("ALLOWED_USER_IDS","").split(",") if x]
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-db = SheetsDB()
+db     = SheetsDB()
 
 
 def auth(update: Update) -> bool:
@@ -27,7 +24,6 @@ def auth(update: Update) -> bool:
         return False
     return True
 
-
 def fmt_mxn(n) -> str:
     return "$" + str(int(n or 0))
 
@@ -35,80 +31,93 @@ def fmt_mxn(n) -> str:
 async def transcribe_voice(file_path: str) -> str:
     from groq import Groq
     client = Groq(api_key=os.environ["GROQ_API_KEY"])
-    with open(file_path, "rb") as f:
+    with open(file_path,"rb") as f:
         result = client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=f,
-            language="es"
+            model="whisper-large-v3-turbo",file=f,language="es"
         )
     return result.text
 
 
 async def extract_data(text: str) -> dict:
-    prompt = (
-        "Analiza este mensaje y extrae la informacion. "
-        "Responde UNICAMENTE con JSON valido, sin texto adicional, sin markdown, sin explicaciones.\n\n"
-        "Mensaje: " + text + "\n\n"
-        "Si es una VENTA de servicio medico estetico, responde:\n"
-        '{"tipo":"venta","datos":{"cliente":"nombre","servicio_id":"botox","servicio_nombre":"Botox","precio":3500,"metodo_pago":"Tarjeta","pagado":true,"notas":null},"resumen_confirmacion":"Botox Ana - $3500 Tarjeta"}\n\n'
-        "Si es un GASTO u compra, responde:\n"
-        '{"tipo":"gasto","datos":{"categoria":"Insumos","descripcion":"descripcion","monto":2800},"resumen_confirmacion":"Gasto Insumos - $2800"}\n\n'
-        "Si es una PREGUNTA sobre el negocio, responde:\n"
-        '{"tipo":"consulta","datos":{"pregunta":"texto de la pregunta"},"resumen_confirmacion":""}\n\n'
-        "Servicios: botox, filler, laser, facial, prp, hidratacion, peeling, biorevitalizacion, consulta, otro\n"
-        "Metodos de pago: Efectivo, Tarjeta, Transferencia\n"
-        "Categorias de gasto: Insumos, Renta, Nomina, Servicios, Marketing, Equipo, Otro\n\n"
-        "IMPORTANTE: Responde SOLO el JSON, nada mas."
-    )
+    prompt = """Eres el asistente del consultorio de medicina estetica Seleah.
+Analiza el mensaje y extrae la informacion. Responde UNICAMENTE con JSON valido sin markdown.
+
+REGLAS CRITICAS:
+1. Nombres de clientes: si el mensaje dice "a Sofia" o "a Ana" el cliente es "Sofia" o "Ana" (quita la "a" preposicion)
+2. Marcas de toxina EXACTAS: Bienox, Dysport, Botox, Xeomin (nunca escribas Vienox u otras variaciones)
+3. Hydrafacial se escribe SIEMPRE con H (nunca Hidrafacial)
+4. Enzimas lipoliticas son un SERVICIO valido (palabras clave: enzimas, lipoliticas, papada, abdomen, brazos)
+5. Si hay DOS servicios en el mensaje, registra el de mayor monto como venta principal y menciona el otro en notas
+6. Creditos de equipo (Ultraformer, Hydrafacial) son GASTOS categoria Credito, no ventas
+7. Impuestos SAT son GASTOS categoria Impuestos
+
+SERVICIOS VALIDOS (usa estos IDs):
+- botox: Botox/toxina botulinica (incluye Bienox, Dysport, Xeomin)
+- filler: Rellenos, acido hialuronico, Sculptra, Radiesse, Profhilo, HarmonyCa, Belotero
+- facial: Hydrafacial (Signature, Deluxe, Platinum)
+- laser: Laser, depilacion
+- prp: PRP
+- nctf: NCTF
+- enzimas: Enzimas lipoliticas, Gencell, PB Serum (papada, abdomen, brazos, cuello)
+- hilos: Hilos lisos
+- biorevitalizacion: Bioestimuladores, Exosomas, ADN salmon
+- peeling: Peeling, dermapen, microneedling
+- consulta: Consulta, valoracion
+- otro: cualquier otro
+
+METODOS DE PAGO: Efectivo, Tarjeta, Transferencia
+MSI: extrae numero de meses si menciona "a X meses" o "X MSI"
+
+CATEGORIAS DE GASTO: Insumos, Renta, Nomina, Servicios, Marketing, Equipo, Credito, Impuestos, Otro
+
+Si es VENTA responde:
+{"tipo":"venta","datos":{"cliente":"nombre","servicio_id":"id","servicio_nombre":"nombre legible","precio":numero,"metodo_pago":"metodo","msi":0,"pagado":true,"factura":false,"notas":null},"resumen_confirmacion":"resumen corto"}
+
+Si es GASTO responde:
+{"tipo":"gasto","datos":{"categoria":"categoria","descripcion":"descripcion","monto":numero},"resumen_confirmacion":"resumen corto"}
+
+Si es PREGUNTA responde:
+{"tipo":"consulta","datos":{"pregunta":"texto"},"resumen_confirmacion":""}
+
+Mensaje a analizar: """ + text + """
+
+IMPORTANTE: Solo JSON, nada mas."""
 
     msg = claude.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}]
+        max_tokens=500,
+        messages=[{"role":"user","content":prompt}]
     )
-
     raw = msg.content[0].text.strip()
-    log.info("Claude raw response: " + raw)
-
-    # Limpieza defensiva por si viene con markdown
+    log.info("Claude raw: " + raw[:200])
+    if "```" in raw:
+        raw = raw.split("```")[1]
+        if raw.startswith("json"): raw = raw[4:]
     raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`").strip()
-        if raw.startswith("json"):
-            raw = raw[4:].strip()
-
-    if raw.lower().startswith("json"):
-        raw = raw[4:].strip()
-
-    # Intenta aislar el objeto JSON si trae texto extra
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-    if start >= 0 and end > start:
-        raw = raw[start:end]
-
+    start = raw.find("{"); end = raw.rfind("}")+1
+    if start>=0 and end>start: raw = raw[start:end]
     return json.loads(raw)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+    if not auth(update): return
     name = update.effective_user.first_name
     await update.message.reply_text(
-        "Hola Dra. " + name + "! Soy tu asistente Seleah.\n\n"
-        "Manda una nota de voz o escribe:\n"
-        "- 'Botox a Ana Garcia, 3500 con tarjeta'\n"
-        "- 'Gasto insumos 2800 pesos'\n"
-        "- 'Cuanto llevo este mes?'\n\n"
+        "Hola Dra. "+name+"! Soy tu asistente Seleah.\n\n"
+        "Manda nota de voz o escribe:\n"
+        "- Botox Bienox a Ana, 40u, 3500 con tarjeta\n"
+        "- Hydrafacial Deluxe a Sofia, 3250 en efectivo\n"
+        "- Enzimas en papada a Karen, 3500 efectivo\n"
+        "- Gasto renta 18000\n"
+        "- Pago impuestos SAT 9200\n\n"
         "/resumen - Resumen del mes\n"
-        "/top - Top servicios"
+        "/top - Top servicios\n"
+        "/clientes - Top clientes"
     )
 
 
 async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+    if not auth(update): return
     await update.message.reply_text("Calculando...")
     try:
         s = db.get_monthly_summary()
@@ -117,7 +126,7 @@ async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Ingresos:  " + fmt_mxn(s["ingresos"]) + "\n"
             "Costos:    " + fmt_mxn(s["costos"]) + "\n"
             "Gastos:    " + fmt_mxn(s["gastos"]) + "\n"
-            "----------------\n"
+            "-------------------\n"
             "Utilidad:  " + fmt_mxn(s["utilidad"]) + "\n\n"
             + str(s["num_ventas"]) + " servicios | "
             + str(s["pendientes"]) + " pendientes de pago"
@@ -128,53 +137,70 @@ async def cmd_resumen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+    if not auth(update): return
     try:
         top = db.get_top_services()
         lines = ["Top Servicios del Mes\n"]
-        for i, s in enumerate(top[:5], 1):
-            lines.append(str(i) + ". " + s["nombre"] + " - " + fmt_mxn(s["ingreso"]))
+        for i,s in enumerate(top[:5],1):
+            lines.append(str(i)+". "+s["nombre"]+" - "+fmt_mxn(s["ingreso"])+" ("+str(s["sesiones"])+" ses.)")
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
-        log.error(str(e))
-        await update.message.reply_text("Error: " + str(e))
+        await update.message.reply_text("Error: "+str(e))
+
+
+async def cmd_clientes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    try:
+        top = db.get_top_clients()
+        lines = ["Top Clientes\n"]
+        for i,c in enumerate(top,1):
+            lines.append(
+                str(i)+". "+str(c.get("Nombre",""))+"\n"
+                "   Total: "+fmt_mxn(c.get("Total_Historico",0))
+                +" | "+str(c.get("Visitas",0))+" visitas"
+            )
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text("Error: "+str(e))
 
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+    if not auth(update): return
     await update.message.reply_text("Escuchando...")
     voice = update.message.voice or update.message.audio
-    file = await ctx.bot.get_file(voice.file_id)
-    path = "/tmp/" + voice.file_id + ".ogg"
-
+    file  = await ctx.bot.get_file(voice.file_id)
+    path  = "/tmp/"+voice.file_id+".ogg"
     await file.download_to_drive(path)
-
     try:
         transcript = await transcribe_voice(path)
-        log.info("Transcripcion: " + transcript)
-        await update.message.reply_text("Escuche: " + transcript)
-
+        log.info("Transcripcion: "+transcript)
+        await update.message.reply_text("Escuche: "+transcript)
         data = await extract_data(transcript)
         await process_extracted(update, ctx, data)
-
     except Exception as e:
-        log.error("Error voz: " + str(e))
+        log.error("Error voz: "+str(e))
         await update.message.reply_text("No pude procesar. Intentalo de nuevo o escribelo.")
     finally:
-        if os.path.exists(path):
-            os.remove(path)
+        import os as _os
+        if _os.path.exists(path): _os.remove(path)
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not auth(update):
-        return
-
+    if not auth(update): return
     text = update.message.text
-    if text.startswith("/"):
+    if text.startswith("/"): return
+
+    # Modo cancelar ultimo registro
+    if text.strip().lower() in ["cancelar","cancel","deshacer"]:
+        last = ctx.user_data.get("last_saved")
+        if last:
+            await update.message.reply_text(
+                "El ultimo registro fue:\n" + last + "\n\n"
+                "Para cancelarlo ve al Sheet y eliminalo manualmente.\n"
+                "Proximamente podre hacerlo automatico."
+            )
+        else:
+            await update.message.reply_text("No tengo registro de la ultima operacion en esta sesion.")
         return
 
     await update.message.reply_text("Procesando...")
@@ -182,113 +208,134 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = await extract_data(text)
         await process_extracted(update, ctx, data)
     except Exception as e:
-        log.error("Error texto: " + str(e))
-        await update.message.reply_text("No entendi el mensaje. Intenta de nuevo.")
+        log.error("Error texto: "+str(e))
+        await update.message.reply_text("No entendi. Intenta de nuevo.")
 
 
 async def process_extracted(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: dict):
-    tipo = data.get("tipo")
-    resumen = data.get("resumen_confirmacion", "Confirmar?")
+    tipo    = data.get("tipo")
+    resumen = data.get("resumen_confirmacion","Confirmar?")
     ctx.user_data["pending"] = data
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Confirmar", callback_data="confirm"),
-         InlineKeyboardButton("Cancelar", callback_data="cancel")],
-        [InlineKeyboardButton("Corregir", callback_data="correct")]
+         InlineKeyboardButton("Cancelar",  callback_data="cancel")],
+        [InlineKeyboardButton("Corregir",  callback_data="correct")]
     ])
 
     if tipo == "venta":
-        d = data.get("datos", {})
+        d   = data["datos"]
+        msi = d.get("msi",0)
+        msi_txt = (" | "+str(msi)+" MSI") if msi and msi>0 else ""
+        fac_txt = " | FACTURA" if d.get("factura") else ""
         msg = (
             "VENTA DETECTADA\n\n"
             "Cliente:  " + str(d.get("cliente") or "Sin nombre") + "\n"
             "Servicio: " + str(d.get("servicio_nombre") or "") + "\n"
-            "Precio:   " + fmt_mxn(d.get("precio", 0)) + "\n"
-            "Metodo:   " + str(d.get("metodo_pago") or "No especificado") + "\n"
-            "Pagado:   " + ("Si" if d.get("pagado") else "No") + "\n\n"
-            + resumen
+            "Precio:   " + fmt_mxn(d.get("precio",0)) + "\n"
+            "Metodo:   " + str(d.get("metodo_pago") or "No especificado") + msi_txt + fac_txt + "\n"
+            "Pagado:   " + ("Si" if d.get("pagado") else "No") + "\n"
         )
+        if d.get("notas"):
+            msg += "Notas:    " + str(d.get("notas")) + "\n"
+        msg += "\n" + resumen
         await update.message.reply_text(msg, reply_markup=keyboard)
 
     elif tipo == "gasto":
-        d = data.get("datos", {})
+        d = data["datos"]
         msg = (
             "GASTO DETECTADO\n\n"
             "Categoria:   " + str(d.get("categoria") or "") + "\n"
             "Descripcion: " + str(d.get("descripcion") or "") + "\n"
-            "Monto:       " + fmt_mxn(d.get("monto", 0)) + "\n\n"
+            "Monto:       " + fmt_mxn(d.get("monto",0)) + "\n\n"
             + resumen
         )
         await update.message.reply_text(msg, reply_markup=keyboard)
 
     elif tipo == "consulta":
-        pregunta = (data.get("datos") or {}).get("pregunta", "")
+        pregunta = data["datos"].get("pregunta","")
         try:
             s = db.get_monthly_summary()
             context = (
-                "Mes: " + s["mes"]
-                + " | Ingresos: " + fmt_mxn(s["ingresos"])
-                + " | Gastos: " + fmt_mxn(s["gastos"])
-                + " | Utilidad: " + fmt_mxn(s["utilidad"])
-                + " | Ventas: " + str(s["num_ventas"])
+                "Mes: "+s["mes"]+" | "
+                "Ingresos: "+fmt_mxn(s["ingresos"])+" | "
+                "Gastos: "+fmt_mxn(s["gastos"])+" | "
+                "Utilidad: "+fmt_mxn(s["utilidad"])+" | "
+                "Ventas: "+str(s["num_ventas"])
             )
             msg = claude.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=200,
-                messages=[{
-                    "role": "user",
-                    "content": context + "\n\nPregunta: " + pregunta + "\n\nResponde en maximo 2 lineas en espanol."
-                }]
+                model="claude-haiku-4-5-20251001", max_tokens=200,
+                messages=[{"role":"user","content":
+                    context+"\n\nPregunta: "+pregunta+
+                    "\n\nResponde en maximo 2 lineas en espanol, con numeros concretos."}]
             )
             await update.message.reply_text(msg.content[0].text)
         except Exception as e:
-            await update.message.reply_text("No pude obtener los datos: " + str(e))
-
+            await update.message.reply_text("Error al consultar: "+str(e))
     else:
-        await update.message.reply_text("No identifique si es venta, gasto o consulta. Se mas especifica.")
+        await update.message.reply_text(
+            "No identifique si es venta, gasto o consulta.\n"
+            "Intenta ser mas especifica, por ejemplo:\n"
+            "- Botox Bienox a Ana, 3500 con tarjeta\n"
+            "- Gasto renta 18000\n"
+            "- Cuanto llevo este mes?"
+        )
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-
-    action = query.data
+    action  = query.data
     pending = ctx.user_data.get("pending")
 
     if action == "confirm" and pending:
         try:
             if pending["tipo"] == "venta":
                 sale_id = db.add_sale(pending["datos"])
-                await query.edit_message_text("Venta registrada! ID: " + sale_id)
+                resumen = (
+                    pending["datos"].get("servicio_nombre","") +
+                    " - " + str(pending["datos"].get("cliente","")) +
+                    " - " + fmt_mxn(pending["datos"].get("precio",0))
+                )
+                ctx.user_data["last_saved"] = resumen
+                await query.edit_message_text("Venta registrada! ID: "+sale_id)
             elif pending["tipo"] == "gasto":
                 exp_id = db.add_expense(pending["datos"])
-                await query.edit_message_text("Gasto registrado! ID: " + exp_id)
+                resumen = (
+                    pending["datos"].get("categoria","") +
+                    " - " + fmt_mxn(pending["datos"].get("monto",0))
+                )
+                ctx.user_data["last_saved"] = resumen
+                await query.edit_message_text("Gasto registrado! ID: "+exp_id)
             ctx.user_data.pop("pending", None)
         except Exception as e:
             log.error(str(e))
-            await query.edit_message_text("Error al guardar: " + str(e))
+            await query.edit_message_text("Error al guardar: "+str(e))
 
     elif action == "cancel":
         ctx.user_data.pop("pending", None)
-        await query.edit_message_text("Cancelado.")
+        await query.edit_message_text("Cancelado. No se registro nada.")
 
     elif action == "correct":
-        await query.edit_message_text("Escribe la correccion:")
+        await query.edit_message_text(
+            "Escribe la correccion, por ejemplo:\n"
+            "El precio fue 4000 no 3500\n"
+            "El cliente es Sofia no Asofia\n"
+            "Es gasto de renta no insumos"
+        )
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("resumen", cmd_resumen))
-    app.add_handler(CommandHandler("top", cmd_top))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("resumen",  cmd_resumen))
+    app.add_handler(CommandHandler("top",      cmd_top))
+    app.add_handler(CommandHandler("clientes", cmd_clientes))
+    app.add_handler(MessageHandler(filters.VOICE|filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
-
     log.info("Seleah Bot iniciado")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
